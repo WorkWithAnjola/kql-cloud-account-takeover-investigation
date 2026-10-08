@@ -1,378 +1,50 @@
-# 🔍 Cloud Incident Response & Threat Hunting
-## Triaging an Account Takeover (ATO) Attack with Kusto Query Language (KQL)
+# Cloud Incident Response & Threat Hunting: Triaging Account Takeover (ATO) with KQL
+
+## Executive Summary
+This project demonstrates an end-to-end Security Operations Center (SOC) triage, behavioral profiling, and threat-hunting investigation using **Kusto Query Language (KQL)** within **Azure Data Explorer (ADX)**. 
+
+The investigation analyzes a cloud identity intrusion against an executive identity (`adele.vance@targetcorp.com`), reconstructing the attacker's trajectory from initial access reconnaissance (low-and-slow password spraying), behavioral deviation from legitimate baselines, and post-exploitation persistence mechanisms (rogue MFA addition and mailbox exfiltration rules).
 
 ---
 
-## 📌 Project Overview
-
-This project demonstrates an end-to-end Security Operations Center (SOC) investigation involving **incident triage, behavioral profiling, threat hunting, and post-compromise analysis** using **Kusto Query Language (KQL)** within **Azure Data Explorer (ADX)**.
-
-The investigation focuses on a simulated cloud identity compromise targeting an executive account:
-
-**Target User:** `adele.vance@targetcorp.com`
-
-The objective was to reconstruct the attack lifecycle, identify the initial access vector, validate suspicious authentication activity, uncover attacker persistence mechanisms, and recommend containment actions.
+## MITRE ATT&CK Mapping
+- **Initial Access:** T1110.003 – Password Spraying
+- **Initial Access:** T1078.004 – Valid Accounts: Cloud Accounts
+- **Defense Evasion:** T1556 – Modify Authentication Process (Rogue MFA Registration)
+- **Collection / Exfiltration:** T1114.001 – Email Collection: Local Email Collection (Inbox Forwarding Rules)
 
 ---
 
-## 🎯 Investigation Objectives
+## Technical Investigation & Evidence
 
-- Identify how the attacker gained access
-- Determine whether the login activity was legitimate or malicious
-- Analyze user behavior against historical baselines
-- Investigate post-authentication actions
-- Detect persistence mechanisms
-- Assess potential data exposure risks
-- Develop a containment and remediation plan
-
----
-
-# 🛡️ MITRE ATT&CK Mapping
-
-| Tactic | Technique | ID |
-|----------|----------|----------|
-| Initial Access | Password Spraying | T1110.003 |
-| Initial Access | Valid Accounts: Cloud Accounts | T1078.004 |
-| Defense Evasion | Modify Authentication Process | T1556 |
-| Collection | Email Collection | T1114.001 |
-| Persistence | Rogue MFA Registration | T1556 |
-| Exfiltration | Inbox Forwarding Rules | T1114.001 |
-
----
-
-# 🚨 Incident Summary
-
-An anomaly alert revealed a successful authentication against an executive cloud account from a suspicious location.
-
-Further investigation uncovered:
-
-- A distributed password spraying campaign
-- Successful compromise of a cloud account
-- Authentication originating from a Tor exit node
-- Unauthorized MFA enrollment
-- Malicious mailbox forwarding rules
-- Potential business email compromise (BEC) activity
-
-The attacker leveraged valid credentials and quickly established persistence to maintain access even after potential password resets.
-
----
-
-# 🔎 Phase 1: Reverse Threat Hunting
-
-## Identifying the Initial Access Vector
-
-Rather than focusing solely on the successful login event, the investigation traced authentication activity backwards to identify precursor events.
-
-Historical sign-in data revealed a password spraying campaign originating from:
-
-**Source IP:** `185.220.101.45`
-
-The IP was identified as a Tor exit node and was observed attempting authentication against multiple users over several days.
-
-Most attempts generated:
-
-```text
-ResultType: 50126
-Meaning: Invalid Username or Password
-```
-
-Eventually, a successful authentication was observed against Adele Vance's account.
-
-### KQL Query
+### 1. Reverse Threat Hunting: Correlating Initial Access
+Following an initial anomaly alert, the investigation traced authentication activity backwards across previous days to identify precursor events. A distributed password spray campaign was detected originating from a Tor exit node (`185.220.101.45`), targeting multiple user principals with authentication error `50126` (Invalid Credentials) before achieving a single successful logon (`ResultType == 0`) on Adele Vance's account.
 
 ```kql
 let SprayIP = "185.220.101.45";
-
 SigninLogs
 | where IPAddress == SprayIP
-| project
-    TimeGenerated,
-    UserPrincipalName,
-    IPAddress,
-    ResultType,
-    Status = iff(ResultType == 0,
-                 "SUCCESSFUL ENTRY POINT",
-                 "FAILED SPRAY ATTEMPT"),
-    Location
+| project TimeGenerated, UserPrincipalName, IPAddress, ResultType, 
+          Status = iff(ResultType == 0, "SUCCESSFUL ENTRY POINT", "FAILED SPRAY ATTEMPT"), 
+          Location
 | order by TimeGenerated asc
-```
-
-### Findings
-
-✅ Multiple failed authentication attempts
-
-✅ Same source IP targeting numerous accounts
-
-✅ Successful authentication after repeated failures
-
-✅ Pattern consistent with Password Spraying (T1110.003)
-
----
-
-# 📊 Phase 2: Behavioral Profiling & Anomaly Detection
-
-## Establishing a User Baseline
-
-Before classifying the login as malicious, historical authentication patterns were analyzed to eliminate potential false positives such as executive travel or remote work.
-
-### Historical User Profile
-
-| Attribute | Normal Behavior |
-|------------|------------|
-| Location | Lagos, Nigeria |
-| Source IP | 102.89.34.12 |
-| Login Window | 08:00 AM – 05:00 PM |
-| Authentication Pattern | Consistent business-hours activity |
-
----
-
-## Suspicious Authentication Event
-
-The successful login immediately deviated from the user's established baseline.
-
-### Observed Anomalies
-
-| Indicator | Observation |
-|------------|------------|
-| Time | 03:00:12 AM |
-| Location | Romania |
-| Network Type | Tor Exit Node |
-| User History | No prior activity from region |
-
----
-
-### KQL Query
-
-```kql
-let TargetUser = "adele.vance@targetcorp.com";
-
+2. Behavioral Profiling & Anomaly DetectionTo eliminate potential false positives (such as approved executive international travel), a behavioral baseline was calculated over the target identity's historical authentication telemetry.Adele's historical baselines established consistent operational hours (08:00–17:00 UTC+1) and an origin of Lagos, NG (102.89.34.12). The compromised session was isolated immediately as anomalous across three parameters:Timestamp: 03:00:12 AM (Off-hours / night)Origin Geolocation: Romania / Tor Exit NodeInfrastructure: Public Anonymization NetworkCode snippetlet TargetUser = "adele.vance@targetcorp.com";
 SigninLogs
-| where UserPrincipalName == TargetUser
-| where ResultType == 0
-| extend
+| where UserPrincipalName == TargetUser and ResultType == 0
+| extend 
     HourOfDay = datetime_part("hour", TimeGenerated),
-    IsAnomalousTime =
-        iff(HourOfDay between (0 .. 6),
-            "YES - Off Hours (Night)",
-            "NO - Business Hours"),
-    IsKnownLocation =
-        iff(Location has "Lagos",
-            "Known Origin",
-            "UNUSUAL / ANOMALOUS ORIGIN")
-| project
-    TimeGenerated,
-    UserPrincipalName,
-    Location,
-    IsKnownLocation,
-    HourOfDay,
-    IsAnomalousTime,
-    IPAddress
+    IsAnomalousTime = iff(datetime_part("hour", TimeGenerated) between (0 .. 6), "YES - Off Hours (Night)", "NO - Business Hours"),
+    IsKnownLocation = iff(Location has "Lagos", "Known Origin", "UNUSUAL / ANOMALOUS ORIGIN")
+| project TimeGenerated, UserPrincipalName, Location, IsKnownLocation, HourOfDay, IsAnomalousTime, IPAddress
 | order by TimeGenerated asc
-```
-
-### Assessment
-
-The login exhibited three strong indicators of compromise:
-
-- 🌍 Unusual geographic origin
-- 🌙 Authentication outside normal working hours
-- 🕵️ Connection through an anonymization service (Tor)
-
-**Conclusion:** High confidence account takeover.
-
----
-
-# 🔥 Phase 3: Post-Compromise Investigation
-
-## Persistence & Exfiltration Audit
-
-Password resets alone do not eliminate attacker access.
-
-Post-authentication telemetry was reviewed to determine whether persistence mechanisms or data exfiltration activities had been established.
-
-Audit logs from Microsoft Entra ID and Exchange Online were analyzed.
-
----
-
-## Persistence Artifact #1
-
-### Rogue MFA Registration
-
-**Timestamp:** `03:04:15 AM`
-
-Shortly after obtaining access, the attacker registered an unauthorized phone number:
-
-```text
-+44 7700 900123
-```
-
-This allowed the threat actor to maintain access even if the account password was changed.
-
-### MITRE ATT&CK
-
-```text
-T1556
-Modify Authentication Process
-```
-
----
-
-## Persistence Artifact #2
-
-### Malicious Mailbox Rule Creation
-
-**Timestamp:** `03:08:40 AM`
-
-The attacker created a hidden inbox rule designed to:
-
-- Monitor incoming financial communications
-- Forward messages externally
-- Remove evidence from the victim's mailbox
-
-### Indicators
-
-**Keyword Filters**
-
-```text
-invoice
-wire
-payment
-```
-
-**Forwarding Address**
-
-```text
-dropbox-exfil@external-evil.com
-```
-
-### MITRE ATT&CK
-
-```text
-T1114.001
-Email Collection
-```
-
----
-
-### KQL Query
-
-```kql
-AuditLogs
-| where ActivityDisplayName in (
-    "User registered security info",
-    "New-InboxRule",
-    "Set-Mailbox",
-    "Add member to role"
-)
-| project
-    TimeGenerated,
-    Actor = InitiatedBy,
-    Source_IP = IPAddress,
-    Persistence_Technique = ActivityDisplayName,
+3. Post-Compromise Persistence & Exfiltration AuditStandard containment mandates evaluating post-authentication telemetry rather than stopping at password resets. Microsoft Entra ID and Exchange AuditLogs were queried to identify unauthorized changes executed within minutes of initial breach.The query identified two critical persistence artifacts established via Tor exit node 185.220.101.45:Rogue MFA Enrollment (03:04:15 AM): Attacker registered an unauthorized mobile number (+44 7700 900123) to maintain authentication access regardless of password resets.Mailbox Tampering (03:08:40 AM): Attacker created a hidden inbox rule (New-InboxRule) designed to auto-forward emails containing "invoice" or "wire" to an external address (dropbox-exfil@external-evil.com) and purge them from the inbox.Code snippetAuditLogs
+| where ActivityDisplayName in ("User registered security info", "New-InboxRule", "Set-Mailbox", "Add member to role")
+| project 
+    TimeGenerated, 
+    Actor = InitiatedBy, 
+    Source_IP = IPAddress, 
+    Persistence_Technique = ActivityDisplayName, 
     Details = AdditionalDetails
 | order by TimeGenerated asc
-```
-
+Containment & Remediation PlanPriorityAction ItemTechnical ExecutionP0 - CriticalSession RevocationRevoke all active tokens using Microsoft Graph / PowerShell: Revoke-AzureADUserAllRefreshToken -ObjectId <Adele_GUID>P0 - CriticalPurge Rogue FactorsRemove unauthorized telephone factor (+44 7700 900123) from user's Entra ID Authentication Methods blade.P1 - HighRemove Mailbox RulesExecute Exchange Online PowerShell: Remove-InboxRule -Mailbox "adele.vance" -Identity "<Rule_ID>"P1 - HighCredential ResetForce an out-of-band password reset with temporary administrative access pass.P2 - MediumPerimeter HardeningBlock malicious Tor exit IP 185.220.101.45 and enforce Conditional Access policies blocking anonymous IP tiers.Key TakeawaysPassword Spraying vs. Brute Force: Attackers utilize multi-day, distributed login attempts across diverse user accounts to circumvent legacy lockout thresholds.Deep Scope of Compromise: Incident containment must audit identity provider logs and mailbox configurations to neutralize backdoors before closing a ticket.
 ---
-
-# 📈 Attack Timeline
-
-| Time | Activity |
-|---------|---------|
-| Day - Several Days | Password spraying campaign begins |
-| Multiple Attempts | Authentication failures (50126) |
-| 03:00:12 AM | Successful login |
-| 03:04:15 AM | Rogue MFA registration |
-| 03:08:40 AM | Malicious mailbox forwarding rule created |
-| Detection | Security alert generated |
-| Investigation | Threat hunting initiated |
-| Containment | Session revocation and remediation |
-
----
-
-# 🚧 Containment & Remediation Plan
-
-| Priority | Action | Technical Execution |
-|------------|------------|------------|
-| P0 - Critical | Revoke Active Sessions | `Revoke-AzureADUserAllRefreshToken -ObjectId <Adele_GUID>` |
-| P0 - Critical | Remove Rogue MFA | Delete unauthorized authentication method from Entra ID |
-| P1 - High | Remove Inbox Rules | `Remove-InboxRule -Mailbox "adele.vance" -Identity "<Rule_ID>"` |
-| P1 - High | Force Password Reset | Out-of-band credential reset |
-| P2 - Medium | Block Threat Infrastructure | Block `185.220.101.45` |
-| P2 - Medium | Conditional Access Hardening | Block anonymous and Tor-based connections |
-| P2 - Medium | User Awareness Training | Executive phishing and credential hygiene training |
-
----
-
-# 🎓 Key Lessons Learned
-
-### Password Spraying is Low and Slow
-
-Unlike brute-force attacks, password spraying distributes authentication attempts across multiple users and time periods, helping attackers avoid account lockout thresholds.
-
----
-
-### Valid Credentials Do Not Equal Legitimate Access
-
-A successful login should always be evaluated against:
-
-- Historical behavior
-- Geographic patterns
-- Login timing
-- Device reputation
-- Network characteristics
-
----
-
-### Persistence Often Occurs Within Minutes
-
-Attackers frequently establish:
-
-- MFA backdoors
-- Inbox forwarding rules
-- Role assignments
-- OAuth application consent
-
-before defenders have time to respond.
-
----
-
-### Password Resets Alone Are Not Enough
-
-Effective incident response requires:
-
-- Session revocation
-- MFA review
-- Audit log analysis
-- Mailbox inspection
-- Identity hygiene validation
-
----
-
-# 🧰 Technologies Used
-
-- Microsoft Azure Data Explorer (ADX)
-- Kusto Query Language (KQL)
-- Microsoft Entra ID
-- Exchange Online Audit Logs
-- Microsoft Sentinel Concepts
-- MITRE ATT&CK Framework
-
----
-
-# ✅ Outcome
-
-The investigation successfully reconstructed the attack chain from initial password spraying activity through post-compromise persistence.
-
-By combining authentication telemetry, behavioral baselining, and audit log analysis, the compromise was confirmed, persistence mechanisms were identified, and containment actions were prioritized to restore account integrity and prevent future access.
-
-This project demonstrates practical SOC analyst skills including:
-
-- Threat Hunting
-- Incident Triage
-- Log Analysis
-- Behavioral Analytics
-- Cloud Identity Security
-- MITRE ATT&CK Mapping
-- KQL Query Development
-- Incident Response
