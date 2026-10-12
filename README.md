@@ -9,9 +9,9 @@
 
 ## Executive Summary
 
-This project demonstrates an end-to-end Security Operations Center (SOC) triage, behavioral profiling, and threat-hunting investigation using **Kusto Query Language (KQL)** within **Azure Data Explorer (ADX)**.
+This project walks through a full SOC triage of an account takeover, using KQL in Azure Data Explorer to go from a single anomaly alert to a complete picture of what the attacker did.
 
-The investigation analyzes a cloud identity intrusion against an executive identity (`adele.vance@targetcorp.com`), reconstructing the attacker's trajectory from initial access reconnaissance (low-and-slow password spraying), through behavioral deviation from legitimate baselines, to post-exploitation persistence mechanisms (rogue MFA addition and mailbox exfiltration rules).
+The target is an executive identity, `adele.vance@targetcorp.com`. The investigation starts with a low and slow password spray campaign, moves into behavioral baselining to confirm the compromise wasn't just unusual travel, and ends with uncovering two separate persistence mechanisms the attacker planted after getting in.
 
 ---
 
@@ -30,7 +30,7 @@ The investigation analyzes a cloud identity intrusion against an executive ident
 
 ### 1. Reverse Threat Hunting: Correlating Initial Access
 
-Following an initial anomaly alert, the investigation traced authentication activity backwards across previous days to identify precursor events. A distributed password spray campaign was detected originating from a Tor exit node (`185.220.101.45`), targeting multiple user principals with authentication error `50126` (Invalid Credentials) before achieving a single successful logon (`ResultType == 0`) on Adele Vance's account.
+After the initial anomaly alert came in, I traced authentication activity backward across the previous few days to find whatever led up to it. That turned up a distributed password spray campaign coming from a Tor exit node (`185.220.101.45`), hitting multiple user accounts with failed logons (`ResultType == 50126`, invalid credentials) before finally landing one successful login on Adele's account.
 
 ```kql
 let SprayIP = "185.220.101.45";
@@ -42,17 +42,15 @@ SigninLogs
 | order by TimeGenerated asc
 ```
 
+![Initial Access & Spray Correlation](./01-initial-access-spray-correlation.png.png)
+
 ---
 
 ### 2. Behavioral Profiling & Anomaly Detection
 
-To eliminate potential false positives (such as approved executive international travel), a behavioral baseline was calculated over the target identity's historical authentication telemetry.
+Before calling this a compromise, I needed to rule out something boring, like approved executive travel. So I built a behavioral baseline from Adele's historical sign in data.
 
-Adele's historical baselines established consistent operational hours (`08:00–17:00 UTC+1`) and an origin of `Lagos, NG` (`102.89.34.12`). The compromised session was isolated immediately as anomalous across three parameters:
-
-- **Timestamp:** `03:00:12 AM` (off-hours / night)
-- **Origin Geolocation:** Romania / Tor exit node
-- **Infrastructure:** Public anonymization network
+That baseline showed consistent hours (08:00 to 17:00, UTC+1) and a consistent origin, Lagos, Nigeria (`102.89.34.12`). The session in question broke the pattern on every axis that mattered: it happened at 3:00 AM, it came from Romania through a Tor exit node, and the infrastructure itself (public anonymization network) had no business touching an executive account.
 
 ```kql
 let TargetUser = "adele.vance@targetcorp.com";
@@ -66,16 +64,15 @@ SigninLogs
 | order by TimeGenerated asc
 ```
 
+![Behavioral Baseline Anomaly](./02-behavioral-baseline-anomaly.png.png)
+
 ---
 
 ### 3. Post-Compromise Persistence & Exfiltration Audit
 
-Standard containment mandates evaluating post-authentication telemetry rather than stopping at password resets. Microsoft Entra ID and Exchange `AuditLogs` were queried to identify unauthorized changes executed within minutes of initial breach.
+A password reset alone doesn't close an incident like this. I queried Entra ID and Exchange `AuditLogs` to see what the attacker actually did once inside, and found two separate persistence mechanisms planted within minutes of the initial login, both from the same Tor exit node.
 
-The query identified two critical persistence artifacts established via the same Tor exit node (`185.220.101.45`):
-
-1. **Rogue MFA Enrollment (`03:04:15 AM`)** — Attacker registered an unauthorized mobile number (`+44 7700 900123`) to maintain authentication access regardless of password resets.
-2. **Mailbox Tampering (`03:08:40 AM`)** — Attacker created a hidden inbox rule (`New-InboxRule`) designed to auto-forward emails containing "invoice" or "wire" to an external address (`dropbox-exfil@external-evil.com`) and purge them from the inbox.
+First, a rogue MFA enrollment at 3:04 AM. The attacker added an unauthorized phone number (`+44 7700 900123`), which would have let them back in even after a password reset. Second, at 3:08 AM, a hidden inbox rule built to auto forward any email mentioning "invoice" or "wire" to an external address, then quietly delete the original from the inbox.
 
 ```kql
 AuditLogs
@@ -89,21 +86,24 @@ AuditLogs
 | order by TimeGenerated asc
 ```
 
+![Persistence & Mailbox Exfiltration](./03-persistence-mfa-mailbox-rules.png.png)
+
 ---
 
 ## Containment & Remediation Plan
 
 | Priority | Action Item | Technical Execution |
 | :--- | :--- | :--- |
-| **P0 – Critical** | Session Revocation | Revoke all active tokens: `Revoke-AzureADUserAllRefreshToken -ObjectId <Adele_GUID>` |
-| **P0 – Critical** | Purge Rogue Factors | Remove unauthorized phone factor (`+44 7700 900123`) from the user's Entra ID Authentication Methods blade |
-| **P1 – High** | Remove Mailbox Rules | `Remove-InboxRule -Mailbox "adele.vance" -Identity "<Rule_ID>"` via Exchange Online PowerShell |
-| **P1 – High** | Credential Reset | Force an out-of-band password reset with a temporary access pass |
-| **P2 – Medium** | Perimeter Hardening | Block malicious Tor exit IP `185.220.101.45` and enforce Conditional Access policies blocking anonymous IP tiers |
+| P0 (Critical) | Session Revocation | Revoke all active tokens: `Revoke-AzureADUserAllRefreshToken -ObjectId <Adele_GUID>` |
+| P0 (Critical) | Purge Rogue Factors | Remove the unauthorized phone factor (`+44 7700 900123`) from the user's Entra ID Authentication Methods blade |
+| P1 (High) | Remove Mailbox Rules | `Remove-InboxRule -Mailbox "adele.vance" -Identity "<Rule_ID>"` via Exchange Online PowerShell |
+| P1 (High) | Credential Reset | Force an out of band password reset with a temporary access pass |
+| P2 (Medium) | Perimeter Hardening | Block the malicious Tor exit IP `185.220.101.45` and enforce Conditional Access policies against anonymous IP tiers |
 
 ---
 
 ## Key Takeaways
 
-- **Password spraying vs. brute force:** Attackers use multi-day, distributed login attempts across diverse user accounts to circumvent legacy lockout thresholds.
-- **Deep scope of compromise:** Incident containment must audit identity provider logs and mailbox configurations to neutralize backdoors before closing a ticket.
+Password spraying isn't brute forcing. Attackers spread login attempts across many accounts over several days specifically to stay under the radar of lockout thresholds built for faster, noisier attacks.
+
+Closing the ticket after a password reset isn't enough either. Real containment means checking the identity provider logs and mailbox configuration too, because that's exactly where this attacker left a way back in.
